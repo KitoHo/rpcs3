@@ -1,11 +1,7 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "Memory.h"
 #include "Emu/System.h"
 #include "Utilities/Thread.h"
-#include "Emu/CPU/CPUThread.h"
-#include "Emu/Cell/PPUThread.h"
-#include "Emu/Cell/SPUThread.h"
-#include "Emu/ARMv7/ARMv7Thread.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -22,8 +18,14 @@
 #endif
 #endif
 
+#include "wait_engine.h"
+
+#include <mutex>
+
 namespace vm
 {
+	thread_local u64 g_tls_fault_count{};
+
 	template<std::size_t Size> struct mapped_ptr_deleter
 	{
 		void operator ()(void* ptr)
@@ -89,66 +91,15 @@ namespace vm
 
 	std::vector<std::shared_ptr<block_t>> g_locations; // memory locations
 
-	//using reservation_mutex_t = std::mutex;
-
-	class reservation_mutex_t
+	access_violation::access_violation(u64 addr, const char* cause)
+		: std::runtime_error(fmt::format("Access violation %s address 0x%llx", cause, addr))
 	{
-		std::atomic<bool> m_lock{ false };
-		std::thread::id m_owner{};
+		g_tls_fault_count &= ~(1ull << 63);
+	}
 
-		std::condition_variable m_cv;
-		std::mutex m_mutex;
+	using reservation_mutex_t = std::mutex;
 
-	public:
-		bool do_notify = false;
-
-		never_inline void lock()
-		{
-			std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
-
-			while (m_lock.exchange(true) == true)
-			{
-				if (m_owner == std::this_thread::get_id())
-				{
-					throw EXCEPTION("Deadlock");
-				}
-
-				if (!lock)
-				{
-					lock.lock();
-					continue;
-				}
-
-				m_cv.wait_for(lock, std::chrono::milliseconds(1));
-			}
-
-			m_owner = std::this_thread::get_id();
-			do_notify = true;
-		}
-
-		never_inline void unlock()
-		{
-			if (m_owner != std::this_thread::get_id())
-			{
-				throw EXCEPTION("Mutex not owned");
-			}
-
-			m_owner = {};
-
-			if (m_lock.exchange(false) == false)
-			{
-				throw EXCEPTION("Lost lock");
-			}
-
-			if (do_notify)
-			{
-				std::lock_guard<std::mutex> lock(m_mutex);
-				m_cv.notify_one();
-			}
-		}
-	};
-
-	const thread_ctrl* volatile g_reservation_owner = nullptr;
+	thread_ctrl* volatile g_reservation_owner = nullptr;
 
 	u32 g_reservation_addr = 0;
 	u32 g_reservation_size = 0;
@@ -156,217 +107,6 @@ namespace vm
 	thread_local bool g_tls_did_break_reservation = false;
 
 	reservation_mutex_t g_reservation_mutex;
-
-	std::array<waiter_t, 1024> g_waiter_list;
-
-	std::size_t g_waiter_max = 0; // min unused position
-	std::size_t g_waiter_nil = 0; // min search position
-
-	std::mutex g_waiter_list_mutex;
-
-	waiter_t* _add_waiter(named_thread_t& thread, u32 addr, u32 size)
-	{
-		std::lock_guard<std::mutex> lock(g_waiter_list_mutex);
-
-		const u64 align = 0x80000000ull >> cntlz32(size);
-
-		if (!size || !addr || size > 4096 || size != align || addr & (align - 1))
-		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
-		}
-
-		thread.mutex.lock();
-
-		// look for empty position
-		for (; g_waiter_nil < g_waiter_max; g_waiter_nil++)
-		{
-			waiter_t& waiter = g_waiter_list[g_waiter_nil];
-
-			if (!waiter.thread)
-			{
-				// store next position for further addition
-				g_waiter_nil++;
-
-				return waiter.reset(addr, size, thread);
-			}
-		}
-
-		if (g_waiter_max >= g_waiter_list.size())
-		{
-			throw EXCEPTION("Waiter list limit broken (%lld)", g_waiter_max);
-		}
-
-		waiter_t& waiter = g_waiter_list[g_waiter_max++];
-
-		g_waiter_nil = g_waiter_max;
-		
-		return waiter.reset(addr, size, thread);
-	}
-
-	void _remove_waiter(waiter_t* waiter)
-	{
-		std::lock_guard<std::mutex> lock(g_waiter_list_mutex);
-
-		// mark as deleted
-		waiter->thread = nullptr;
-
-		// amortize adding new element
-		g_waiter_nil = std::min<std::size_t>(g_waiter_nil, waiter - g_waiter_list.data());
-
-		// amortize polling
-		while (g_waiter_max && !g_waiter_list[g_waiter_max - 1].thread)
-		{
-			g_waiter_max--;
-		}
-	}
-
-	bool waiter_t::try_notify()
-	{
-		std::lock_guard<std::mutex> lock(thread->mutex);
-
-		try
-		{
-			// test predicate
-			if (!pred || !pred())
-			{
-				return false;
-			}
-
-			// clear predicate
-			pred = nullptr;
-		}
-		catch (...)
-		{
-			// capture any exception possibly thrown by predicate
-			pred = [exception = std::current_exception()]() -> bool
-			{
-				// new predicate will throw the captured exception from the original thread
-				std::rethrow_exception(exception);
-			};
-		}
-
-		// set addr and mask to invalid values to prevent further polling
-		addr = 0;
-		mask = ~0;
-
-		// signal thread
-		thread->cv.notify_one();
-
-		return true;
-	}
-
-	waiter_lock_t::waiter_lock_t(named_thread_t& thread, u32 addr, u32 size)
-		: m_waiter(_add_waiter(thread, addr, size))
-		, m_lock(thread.mutex, std::adopt_lock) // must be locked in _add_waiter
-	{
-	}
-
-	void waiter_lock_t::wait()
-	{
-		// if another thread successfully called pred(), it must be set to null
-		while (m_waiter->pred)
-		{
-			// if pred() called by another thread threw an exception, it'll be rethrown
-			if (m_waiter->pred())
-			{
-				return;
-			}
-
-			CHECK_EMU_STATUS;
-
-			m_waiter->thread->cv.wait(m_lock);
-		}
-	}	
-
-	waiter_lock_t::~waiter_lock_t()
-	{
-		// reset some data to avoid excessive signaling
-		m_waiter->addr = 0;
-		m_waiter->mask = ~0;
-		m_waiter->pred = nullptr;
-
-		// unlock thread's mutex to avoid deadlock with g_waiter_list_mutex
-		m_lock.unlock();
-
-		_remove_waiter(m_waiter);
-	}
-
-	void _notify_at(u32 addr, u32 size)
-	{
-		// skip notification if no waiters available
-		if (_mm_mfence(), !g_waiter_max) return;
-
-		std::lock_guard<std::mutex> lock(g_waiter_list_mutex);
-
-		const u32 mask = ~(size - 1);
-
-		for (std::size_t i = 0; i < g_waiter_max; i++)
-		{
-			waiter_t& waiter = g_waiter_list[i];
-
-			// check address range overlapping using masks generated from size (power of 2)
-			if (waiter.thread && ((waiter.addr ^ addr) & (mask & waiter.mask)) == 0)
-			{
-				waiter.try_notify();
-			}
-		}
-	}
-
-	void notify_at(u32 addr, u32 size)
-	{
-		const u64 align = 0x80000000ull >> cntlz32(size);
-
-		if (!size || !addr || size > 4096 || size != align || addr & (align - 1))
-		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
-		}
-
-		_notify_at(addr, size);
-	}
-
-	bool notify_all()
-	{
-		std::unique_lock<std::mutex> lock(g_waiter_list_mutex);
-
-		std::size_t waiters = 0;
-		std::size_t signaled = 0;
-
-		for (std::size_t i = 0; i < g_waiter_max; i++)
-		{
-			waiter_t& waiter = g_waiter_list[i];
-
-			if (waiter.thread && waiter.addr)
-			{
-				waiters++;
-
-				if (waiter.try_notify())
-				{
-					signaled++;
-				}
-			}
-		}
-
-		// return true if waiter list is empty or all available waiters were signaled
-		return waiters == signaled;
-	}
-
-	void start()
-	{
-		// start notification thread
-		thread_ctrl::spawn(PURE_EXPR("vm::start thread"s), []()
-		{
-			while (!Emu.IsStopped())
-			{
-				// poll waiters periodically (TODO)
-				while (!notify_all() && !Emu.IsPaused())
-				{
-					std::this_thread::yield();
-				}
-
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			}
-		});
-	}
 
 	void _reservation_set(u32 addr, bool no_access = false)
 	{
@@ -377,7 +117,7 @@ namespace vm
 		if (::mprotect(vm::base(addr & ~0xfff), 4096, no_access ? PROT_NONE : PROT_READ))
 #endif
 		{
-			throw EXCEPTION("System failure (addr=0x%x)", addr);
+			fmt::throw_exception("System failure (addr=0x%x)" HERE, addr);
 		}
 	}
 
@@ -392,7 +132,7 @@ namespace vm
 			if (::mprotect(vm::base(addr & ~0xfff), 4096, PROT_READ | PROT_WRITE))
 #endif
 			{
-				throw EXCEPTION("System failure (addr=0x%x)", addr);
+				fmt::throw_exception("System failure (addr=0x%x)" HERE, addr);
 			}
 
 			g_reservation_addr = 0;
@@ -414,7 +154,7 @@ namespace vm
 
 		if ((g_tls_did_break_reservation = _reservation_break(addr)))
 		{
-			lock.unlock(), _notify_at(raddr, rsize);
+			lock.unlock(), vm::notify_at(raddr, rsize);
 		}
 	}
 
@@ -422,18 +162,18 @@ namespace vm
 	{
 		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
-		const u64 align = 0x80000000ull >> cntlz32(size);
+		const u64 align = 0x80000000ull >> cntlz32(size, true);
 
 		if (!size || !addr || size > 4096 || size != align || addr & (align - 1))
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		const u8 flags = g_pages[addr >> 12];
 
 		if (!(flags & page_writable) || !(flags & page_allocated) || (flags & page_no_reservations))
 		{
-			throw EXCEPTION("Invalid page flags (addr=0x%x, size=0x%x, flags=0x%x)", addr, size, flags);
+			fmt::throw_exception("Invalid page flags (addr=0x%x, size=0x%x, flags=0x%x)" HERE, addr, size, flags);
 		}
 
 		// break the reservation
@@ -458,11 +198,11 @@ namespace vm
 	{
 		std::unique_lock<reservation_mutex_t> lock(g_reservation_mutex);
 
-		const u64 align = 0x80000000ull >> cntlz32(size);
+		const u64 align = 0x80000000ull >> cntlz32(size, true);
 
 		if (!size || !addr || size > 4096 || size != align || addr & (align - 1))
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		if (g_reservation_owner != thread_ctrl::get_current() || g_reservation_addr != addr || g_reservation_size != size)
@@ -481,7 +221,7 @@ namespace vm
 		_reservation_break(addr);
 
 		// notify waiter
-		lock.unlock(), _notify_at(addr, size);
+		lock.unlock(), vm::notify_at(addr, size);
 
 		// atomic update succeeded
 		return true;
@@ -509,7 +249,7 @@ namespace vm
 				// break the reservation if overlap
 				if ((g_tls_did_break_reservation = _reservation_break(addr)))
 				{
-					lock.unlock(), _notify_at(raddr, rsize);
+					lock.unlock(), vm::notify_at(raddr, rsize);
 				}
 			}
 			
@@ -519,7 +259,7 @@ namespace vm
 		return true;
 	}
 
-	bool reservation_test(const thread_ctrl* current)
+	bool reservation_test(thread_ctrl* current)
 	{
 		const auto owner = g_reservation_owner;
 
@@ -528,11 +268,13 @@ namespace vm
 
 	void reservation_free()
 	{
-		if (reservation_test())
+		auto thread = thread_ctrl::get_current();
+
+		if (reservation_test(thread))
 		{
 			std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
-			if (g_reservation_owner && g_reservation_owner == thread_ctrl::get_current())
+			if (g_reservation_owner && g_reservation_owner == thread)
 			{
 				g_tls_did_break_reservation = _reservation_break(g_reservation_addr);
 			}
@@ -543,11 +285,11 @@ namespace vm
 	{
 		std::unique_lock<reservation_mutex_t> lock(g_reservation_mutex);
 
-		const u64 align = 0x80000000ull >> cntlz32(size);
+		const u64 align = 0x80000000ull >> cntlz32(size, true);
 
 		if (!size || !addr || size > 4096 || size != align || addr & (align - 1))
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		g_tls_did_break_reservation = false;
@@ -581,21 +323,21 @@ namespace vm
 		_reservation_break(addr);
 
 		// notify waiter
-		lock.unlock(), _notify_at(addr, size);
+		lock.unlock(), vm::notify_at(addr, size);
 	}
 
 	void _page_map(u32 addr, u32 size, u8 flags)
 	{
 		if (!size || (size | addr) % 4096 || flags & page_allocated)
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
 			if (g_pages[i])
 			{
-				throw EXCEPTION("Memory already mapped (addr=0x%x, size=0x%x, flags=0x%x, current_addr=0x%x)", addr, size, flags, i * 4096);
+				fmt::throw_exception("Memory already mapped (addr=0x%x, size=0x%x, flags=0x%x, current_addr=0x%x)" HERE, addr, size, flags, i * 4096);
 			}
 		}
 
@@ -610,14 +352,14 @@ namespace vm
 		if (::mprotect(priv_addr, size, PROT_READ | PROT_WRITE) || ::mprotect(real_addr, size, protection))
 #endif
 		{
-			throw EXCEPTION("System failure (addr=0x%x, size=0x%x, flags=0x%x)", addr, size, flags);
+			fmt::throw_exception("System failure (addr=0x%x, size=0x%x, flags=0x%x)" HERE, addr, size, flags);
 		}
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
 			if (g_pages[i].exchange(flags | page_allocated))
 			{
-				throw EXCEPTION("Concurrent access (addr=0x%x, size=0x%x, flags=0x%x, current_addr=0x%x)", addr, size, flags, i * 4096);
+				fmt::throw_exception("Concurrent access (addr=0x%x, size=0x%x, flags=0x%x, current_addr=0x%x)" HERE, addr, size, flags, i * 4096);
 			}
 		}
 
@@ -630,7 +372,7 @@ namespace vm
 
 		if (!size || (size | addr) % 4096)
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		const u8 flags_inv = flags_set & flags_clear;
@@ -654,8 +396,8 @@ namespace vm
 		{
 			_reservation_break(i * 4096);
 
-			const u8 f1 = g_pages[i]._or(flags_set & ~flags_inv) & (page_writable | page_readable);
-			g_pages[i]._and_not(flags_clear & ~flags_inv);
+			const u8 f1 = g_pages[i].fetch_or(flags_set & ~flags_inv) & (page_writable | page_readable);
+			g_pages[i].fetch_and(~(flags_clear & ~flags_inv));
 			const u8 f2 = (g_pages[i] ^= flags_inv) & (page_writable | page_readable);
 
 			if (f1 != f2)
@@ -672,7 +414,7 @@ namespace vm
 				if (::mprotect(real_addr, 4096, protection))
 #endif
 				{
-					throw EXCEPTION("System failure (addr=0x%x, size=0x%x, flags_test=0x%x, flags_set=0x%x, flags_clear=0x%x)", addr, size, flags_test, flags_set, flags_clear);
+					fmt::throw_exception("System failure (addr=0x%x, size=0x%x, flags_test=0x%x, flags_set=0x%x, flags_clear=0x%x)" HERE, addr, size, flags_test, flags_set, flags_clear);
 				}
 			}
 		}
@@ -684,14 +426,14 @@ namespace vm
 	{
 		if (!size || (size | addr) % 4096)
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
 			if ((g_pages[i] & page_allocated) == 0)
 			{
-				throw EXCEPTION("Memory not mapped (addr=0x%x, size=0x%x, current_addr=0x%x)", addr, size, i * 4096);
+				fmt::throw_exception("Memory not mapped (addr=0x%x, size=0x%x, current_addr=0x%x)" HERE, addr, size, i * 4096);
 			}
 		}
 
@@ -701,7 +443,7 @@ namespace vm
 
 			if (!(g_pages[i].exchange(0) & page_allocated))
 			{
-				throw EXCEPTION("Concurrent access (addr=0x%x, size=0x%x, current_addr=0x%x)", addr, size, i * 4096);
+				fmt::throw_exception("Concurrent access (addr=0x%x, size=0x%x, current_addr=0x%x)" HERE, addr, size, i * 4096);
 			}
 		}
 
@@ -716,7 +458,7 @@ namespace vm
 		if (::mprotect(real_addr, size, PROT_NONE) || ::mprotect(priv_addr, size, PROT_NONE))
 #endif
 		{
-			throw EXCEPTION("System failure (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("System failure (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 	}
 
@@ -738,40 +480,40 @@ namespace vm
 		return true;
 	}
 
-	u32 alloc(u32 size, memory_location_t location, u32 align)
+	u32 alloc(u32 size, memory_location_t location, u32 align, u32 sup)
 	{
 		const auto block = get(location);
 
 		if (!block)
 		{
-			throw EXCEPTION("Invalid memory location (%d)", location);
+			fmt::throw_exception("Invalid memory location (%u)" HERE, (uint)location);
 		}
 
-		return block->alloc(size, align);
+		return block->alloc(size, align, sup);
 	}
 
-	u32 falloc(u32 addr, u32 size, memory_location_t location)
+	u32 falloc(u32 addr, u32 size, memory_location_t location, u32 sup)
 	{
 		const auto block = get(location, addr);
 
 		if (!block)
 		{
-			throw EXCEPTION("Invalid memory location (%d, addr=0x%x)", location, addr);
+			fmt::throw_exception("Invalid memory location (%u, addr=0x%x)" HERE, (uint)location, addr);
 		}
 
-		return block->falloc(addr, size);
+		return block->falloc(addr, size, sup);
 	}
 
-	bool dealloc(u32 addr, memory_location_t location)
+	u32 dealloc(u32 addr, memory_location_t location, u32* sup_out)
 	{
 		const auto block = get(location, addr);
 
 		if (!block)
 		{
-			throw EXCEPTION("Invalid memory location (%d, addr=0x%x)", location, addr);
+			fmt::throw_exception("Invalid memory location (%u, addr=0x%x)" HERE, (uint)location, addr);
 		}
 
-		return block->dealloc(addr);
+		return block->dealloc(addr, sup_out);
 	}
 
 	void dealloc_verbose_nothrow(u32 addr, memory_location_t location) noexcept
@@ -780,7 +522,7 @@ namespace vm
 
 		if (!block)
 		{
-			LOG_ERROR(MEMORY, "vm::dealloc(): invalid memory location (%d, addr=0x%x)\n", location, addr);
+			LOG_ERROR(MEMORY, "vm::dealloc(): invalid memory location (%u, addr=0x%x)\n", (uint)location, addr);
 			return;
 		}
 
@@ -791,9 +533,9 @@ namespace vm
 		}
 	}
 
-	bool block_t::try_alloc(u32 addr, u32 size)
+	bool block_t::try_alloc(u32 addr, u32 size, u32 sup)
 	{
-		// check if memory area is already mapped
+		// Check if memory area is already mapped
 		for (u32 i = addr / 4096; i <= (addr + size - 1) / 4096; i++)
 		{
 			if (g_pages[i])
@@ -802,86 +544,70 @@ namespace vm
 			}
 		}
 
-		// try to reserve "physical" memory
-		if (!used.atomic_op([=](u32& used) -> bool
-		{
-			if (used > this->size)
-			{
-				throw EXCEPTION("Unexpected memory amount used (0x%x)", used);
-			}
-
-			if (used + size > this->size)
-			{
-				return false;
-			}
-
-			used += size;
-
-			return true;
-		}))
-		{
-			return false;
-		}
-
-		// map memory pages
+		// Map "real" memory pages
 		_page_map(addr, size, page_readable | page_writable);
 
-		// add entry
+		// Add entry
 		m_map[addr] = size;
 
+		// Add supplementary info if necessary
+		if (sup) m_sup[addr] = sup;
+
 		return true;
+	}
+
+	block_t::block_t(u32 addr, u32 size, u64 flags)
+		: addr(addr)
+		, size(size)
+		, flags(flags)
+	{
 	}
 
 	block_t::~block_t()
 	{
 		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
-		// deallocate all memory
+		// Deallocate all memory
 		for (auto& entry : m_map)
 		{
 			_page_unmap(entry.first, entry.second);
 		}
 	}
 
-	u32 block_t::alloc(u32 size, u32 align)
+	u32 block_t::alloc(u32 size, u32 align, u32 sup)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
-		// align to minimal page size
+		// Align to minimal page size
 		size = ::align(size, 4096);
 
-		// check alignment (it's page allocation, so passing small values there is just silly)
-		if (align < 4096 || align != (0x80000000u >> cntlz32(align)))
+		// Check alignment (it's page allocation, so passing small values there is just silly)
+		if (align < 4096 || align != (0x80000000u >> cntlz32(align, true)))
 		{
-			throw EXCEPTION("Invalid alignment (size=0x%x, align=0x%x)", size, align);
+			fmt::throw_exception("Invalid alignment (size=0x%x, align=0x%x)" HERE, size, align);
 		}
 
-		// return if size is invalid
+		// Return if size is invalid
 		if (!size || size > this->size)
 		{
 			return 0;
 		}
 
-		// search for an appropriate place (unoptimized)
+		// Search for an appropriate place (unoptimized)
 		for (u32 addr = ::align(this->addr, align); addr < this->addr + this->size - 1; addr += align)
 		{
-			if (try_alloc(addr, size))
+			if (try_alloc(addr, size, sup))
 			{
 				return addr;
-			}
-
-			if (used + size > this->size)
-			{
-				return 0;
 			}
 		}
 
 		return 0;
 	}
 
-	u32 block_t::falloc(u32 addr, u32 size)
+	u32 block_t::falloc(u32 addr, u32 size, u32 sup)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
 		// align to minimal page size
 		size = ::align(size, 4096);
@@ -892,7 +618,7 @@ namespace vm
 			return 0;
 		}
 
-		if (!try_alloc(addr, size))
+		if (!try_alloc(addr, size, sup))
 		{
 			return 0;
 		}
@@ -900,9 +626,9 @@ namespace vm
 		return addr;
 	}
 
-	bool block_t::dealloc(u32 addr)
+	u32 block_t::dealloc(u32 addr, u32* sup_out)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
 		const auto found = m_map.find(addr);
 
@@ -910,19 +636,36 @@ namespace vm
 		{
 			const u32 size = found->second;
 
-			// remove entry
+			// Remove entry
 			m_map.erase(found);
 
-			// return "physical" memory
-			used -= size;
+			// Unmap "real" memory pages
+			_page_unmap(addr, size);
 
-			// unmap memory pages
-			std::lock_guard<reservation_mutex_t>{ g_reservation_mutex }, _page_unmap(addr, size);
+			// Write supplementary info if necessary
+			if (sup_out) *sup_out = m_sup[addr];
 
-			return true;
+			// Remove supplementary info
+			m_sup.erase(addr);
+
+			return size;
 		}
 
-		return false;
+		return 0;
+	}
+
+	u32 block_t::used()
+	{
+		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
+
+		u32 result = 0;
+
+		for (auto& entry : m_map)
+		{
+			result += entry.second;
+		}
+
+		return result;
 	}
 
 	std::shared_ptr<block_t> map(u32 addr, u32 size, u64 flags)
@@ -931,7 +674,7 @@ namespace vm
 
 		if (!size || (size | addr) % 4096)
 		{
-			throw EXCEPTION("Invalid arguments (addr=0x%x, size=0x%x)", addr, size);
+			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
 
 		for (auto& block : g_locations)
@@ -951,7 +694,7 @@ namespace vm
 		{
 			if (g_pages[i])
 			{
-				throw EXCEPTION("Unexpected pages allocated (current_addr=0x%x)", i * 4096);
+				fmt::throw_exception("Unexpected pages allocated (current_addr=0x%x)" HERE, i * 4096);
 			}
 		}
 
@@ -962,7 +705,7 @@ namespace vm
 		return block;
 	}
 
-	std::shared_ptr<block_t> unmap(u32 addr)
+	std::shared_ptr<block_t> unmap(u32 addr, bool must_be_empty)
 	{
 		std::lock_guard<reservation_mutex_t> lock(g_reservation_mutex);
 
@@ -970,6 +713,11 @@ namespace vm
 		{
 			if (*it && (*it)->addr == addr)
 			{
+				if (must_be_empty && (!it->unique() || (*it)->used()))
+				{
+					return *it;
+				}
+
 				auto block = std::move(*it);
 				g_locations.erase(it);
 				return block;
@@ -1005,6 +753,8 @@ namespace vm
 
 		return nullptr;
 	}
+
+	extern void start();
 
 	namespace ps3
 	{
@@ -1063,129 +813,61 @@ namespace vm
 		g_locations.clear();
 	}
 
-	u32 stack_push(u32 size, u32 align_v)
+	[[noreturn]] void throw_access_violation(u64 addr, const char* cause)
 	{
-		if (auto cpu = get_current_cpu_thread()) switch (cpu->get_type())
-		{
-		case CPU_THREAD_PPU:
-		{
-			PPUThread& context = static_cast<PPUThread&>(*cpu);
+		throw access_violation(addr, cause);
+	}
+}
 
-			const u32 old_pos = VM_CAST(context.GPR[1]);
-			context.GPR[1] -= align(size + 4, 8); // room minimal possible size
-			context.GPR[1] &= ~(align_v - 1); // fix stack alignment
+void fmt_class_string<vm::_ptr_base<const void>>::format(std::string& out, u64 arg)
+{
+	fmt_class_string<u32>::format(out, arg);
+}
 
-			if (context.GPR[1] < context.stack_addr)
-			{
-				throw EXCEPTION("Stack overflow (size=0x%x, align=0x%x, SP=0x%llx, stack=*0x%x)", size, align_v, old_pos, context.stack_addr);
-			}
-			else
-			{
-				const u32 addr = static_cast<u32>(context.GPR[1]);
-				vm::ps3::_ref<nse_t<u32>>(addr + size) = old_pos;
-				return addr;
-			}
-		}
-
-		case CPU_THREAD_SPU:
-		case CPU_THREAD_RAW_SPU:
-		{
-			SPUThread& context = static_cast<SPUThread&>(*cpu);
-
-			const u32 old_pos = context.gpr[1]._u32[3];
-			context.gpr[1]._u32[3] -= align(size + 4, 16);
-			context.gpr[1]._u32[3] &= ~(align_v - 1);
-
-			if (context.gpr[1]._u32[3] >= 0x40000) // extremely rough
-			{
-				throw EXCEPTION("Stack overflow (size=0x%x, align=0x%x, SP=LS:0x%05x)", size, align_v, old_pos);
-			}
-			else
-			{
-				const u32 addr = context.gpr[1]._u32[3] + context.offset;
-				vm::ps3::_ref<nse_t<u32>>(addr + size) = old_pos;
-				return addr;
-			}
-		}
-
-		case CPU_THREAD_ARMv7:
-		{
-			ARMv7Context& context = static_cast<ARMv7Thread&>(*cpu);
-
-			const u32 old_pos = context.SP;
-			context.SP -= align(size + 4, 4); // room minimal possible size
-			context.SP &= ~(align_v - 1); // fix stack alignment
-
-			if (context.SP < context.stack_addr)
-			{
-				throw EXCEPTION("Stack overflow (size=0x%x, align=0x%x, SP=0x%x, stack=*0x%x)", size, align_v, context.SP, context.stack_addr);
-			}
-			else
-			{
-				vm::psv::_ref<nse_t<u32>>(context.SP + size) = old_pos;
-				return context.SP;
-			}
-		}
-
-		default:
-		{
-			throw EXCEPTION("Invalid thread type (%d)", cpu->get_type());
-		}
-		}
-
-		throw EXCEPTION("Invalid thread");
+void fmt_class_string<vm::_ptr_base<const char>>::format(std::string& out, u64 arg)
+{
+	// Special case (may be allowed for some arguments)
+	if (arg == 0)
+	{
+		out += u8"«NULL»";
+		return;
 	}
 
-	void stack_pop(u32 addr, u32 size)
+	// Filter certainly invalid addresses (TODO)
+	if (arg < 0x10000 || arg >= 0xf0000000)
 	{
-		if (auto cpu = get_current_cpu_thread()) switch (cpu->get_type())
-		{
-		case CPU_THREAD_PPU:
-		{
-			PPUThread& context = static_cast<PPUThread&>(*cpu);
+		out += u8"«INVALID_ADDRESS:";
+		fmt_class_string<u32>::format(out, arg);
+		out += u8"»";
+		return;
+	}
 
-			if (context.GPR[1] != addr)
+	const auto start = out.size();
+
+	try
+	{
+		out += u8"“";
+
+		for (vm::_ptr_base<const volatile char> ptr = vm::cast(arg);; ptr++)
+		{
+			if (const char ch = *ptr)
 			{
-				throw EXCEPTION("Stack inconsistency (addr=0x%x, SP=0x%llx, size=0x%x)", addr, context.GPR[1], size);
+				out += ch;
 			}
-
-			context.GPR[1] = vm::ps3::_ref<nse_t<u32>>(context.GPR[1] + size);
-			return;
-		}
-
-		case CPU_THREAD_SPU:
-		case CPU_THREAD_RAW_SPU:
-		{
-			SPUThread& context = static_cast<SPUThread&>(*cpu);
-
-			if (context.gpr[1]._u32[3] + context.offset != addr)
+			else
 			{
-				throw EXCEPTION("Stack inconsistency (addr=0x%x, SP=LS:0x%05x, size=0x%x)", addr, context.gpr[1]._u32[3], size);
+				break;
 			}
-
-			context.gpr[1]._u32[3] = vm::ps3::_ref<nse_t<u32>>(context.gpr[1]._u32[3] + context.offset + size);
-			return;
 		}
 
-		case CPU_THREAD_ARMv7:
-		{
-			ARMv7Context& context = static_cast<ARMv7Thread&>(*cpu);
-
-			if (context.SP != addr)
-			{
-				throw EXCEPTION("Stack inconsistency (addr=0x%x, SP=0x%x, size=0x%x)", addr, context.SP, size);
-			}
-
-			context.SP = vm::psv::_ref<nse_t<u32>>(context.SP + size);
-			return;
-		}
-
-		default:
-		{
-			throw EXCEPTION("Invalid thread type (%d)", cpu->get_type());
-		}
-		}
-
-		throw EXCEPTION("Invalid thread");
+		out += u8"”";
+	}
+	catch (const vm::access_violation&)
+	{
+		// Recover from invalid memory access
+		out.resize(start);
+		out += u8"«INVALID_ADDRESS:";
+		fmt_class_string<u32>::format(out, arg);
+		out += u8"»";
 	}
 }

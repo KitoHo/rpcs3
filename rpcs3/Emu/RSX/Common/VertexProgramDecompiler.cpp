@@ -3,6 +3,8 @@
 
 #include "VertexProgramDecompiler.h"
 
+#include <algorithm>
+
 std::string VertexProgramDecompiler::GetMask(bool is_sca)
 {
 	std::string ret;
@@ -71,10 +73,10 @@ std::string VertexProgramDecompiler::GetSRC(const u32 n)
 
 	switch (src[n].reg_type)
 	{
-	case 1: //temp
+	case RSX_VP_REGISTER_TYPE_TEMP:
 		ret += m_parr.AddParam(PF_PARAM_NONE, getFloatTypeName(4), "tmp" + std::to_string(src[n].tmp_src));
 		break;
-	case 2: //input
+	case RSX_VP_REGISTER_TYPE_INPUT:
 		if (d1.input_src < (sizeof(reg_table) / sizeof(reg_table[0])))
 		{
 			ret += m_parr.AddParam(PF_PARAM_IN, getFloatTypeName(4), reg_table[d1.input_src], d1.input_src);
@@ -85,7 +87,7 @@ std::string VertexProgramDecompiler::GetSRC(const u32 n)
 			ret += m_parr.AddParam(PF_PARAM_IN, getFloatTypeName(4), "in_unk", d1.input_src);
 		}
 		break;
-	case 3: //const
+	case RSX_VP_REGISTER_TYPE_CONSTANT:
 		m_parr.AddParam(PF_PARAM_UNIFORM, getFloatTypeName(4), std::string("vc[468]"));
 		ret += std::string("vc[") + std::to_string(d1.const_src) + (d3.index_const ? " + " + AddAddrReg() : "") + "]";
 		break;
@@ -187,7 +189,7 @@ std::string VertexProgramDecompiler::GetFunc()
 
 std::string VertexProgramDecompiler::GetTex()
 {
-	return m_parr.AddParam(PF_PARAM_UNIFORM, "sampler2D", std::string("vtex") + std::to_string(/*?.tex_num*/0));
+	return m_parr.AddParam(PF_PARAM_UNIFORM, "sampler2D", std::string("vtex") + std::to_string(d2.tex_num));
 }
 
 std::string VertexProgramDecompiler::Format(const std::string& code)
@@ -395,7 +397,6 @@ std::string VertexProgramDecompiler::BuildCode()
 	{
 		lvl -= m_instructions[i].close_scopes;
 		if (lvl < 1) lvl = 1;
-		//assert(lvl >= 1);
 		for (int j = 0; j < m_instructions[i].put_close_scopes; ++j)
 		{
 			--lvl;
@@ -673,7 +674,7 @@ std::string VertexProgramDecompiler::Decompile()
 		case RSX_VEC_OPCODE_SNE: SetDSTVec(getFloatTypeName(4) + "(" + compareFunction(COMPARE::FUNCTION_SNE, "$0", "$1") + ")"); break;
 		case RSX_VEC_OPCODE_STR: SetDSTVec(getFunction(FUNCTION::FUNCTION_STR)); break;
 		case RSX_VEC_OPCODE_SSG: SetDSTVec("sign($0)"); break;
-		case RSX_VEC_OPCODE_TXL: SetDSTVec("texture($t, $0.xy)"); break;
+		case RSX_VEC_OPCODE_TXL: SetDSTVec(getFunction(FUNCTION::FUNCTION_VERTEX_TEXTURE_FETCH2D)); break;
 
 		default:
 			AddCode(fmt::format("//Unknown vp opcode 0x%x", u32{ d1.vec_opcode }));
